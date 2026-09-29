@@ -1,0 +1,17 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# Secrets
+.env
+
+# macOS
+.DS_Store
+
+# React
+frontend/node_modules/
+frontend/dist/
+
+# Uploaded study files
+data/
