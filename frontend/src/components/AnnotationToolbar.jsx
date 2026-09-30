@@ -1,5 +1,6 @@
 import { useState } from "react";
 
+
 const COLORS = [
   { name: "yellow", value: "#f3df8b" },
   { name: "blue", value: "#a9d6e5" },
@@ -8,15 +9,39 @@ const COLORS = [
   { name: "purple", value: "#cdb4db" },
 ];
 
+
 export default function AnnotationToolbar({
   position,
   onApply,
-  onCancel,
+  onRemove,
+  onClose,
+  canRemove,
 }) {
-  const [type, setType] = useState("underline");
-  const [color, setColor] = useState(COLORS[0].value);
-  const [underlineStyle, setUnderlineStyle] =
-    useState("straight");
+  const [selectedColor, setSelectedColor] = useState(
+    COLORS[0].value
+  );
+
+  const [showUnderlineStyles, setShowUnderlineStyles] =
+    useState(false);
+
+
+  function applyUnderline(underlineStyle) {
+    onApply({
+      type: "underline",
+      color: selectedColor,
+      underlineStyle,
+    });
+  }
+
+
+  function applyHighlight() {
+    onApply({
+      type: "highlight",
+      color: selectedColor,
+      underlineStyle: "straight",
+    });
+  }
+
 
   return (
     <div
@@ -25,80 +50,102 @@ export default function AnnotationToolbar({
         left: position.x,
         top: position.y,
       }}
+      onMouseDown={(event) =>
+        event.preventDefault()
+      }
     >
-      <div className="annotation-types">
-        <button
-          className={type === "underline" ? "selected" : ""}
-          onClick={() => setType("underline")}
-        >
-          Underline
-        </button>
+      <button
+        className="annotation-toolbar-close"
+        onClick={onClose}
+        aria-label="Close annotation toolbar"
+        title="Close"
+      >
+        ×
+      </button>
+
+
+      <div className="annotation-toolbar-row">
+
+        <div className="annotation-tool-group">
+          <button
+            className={
+              showUnderlineStyles
+                ? "annotation-tool-active"
+                : ""
+            }
+            onClick={() =>
+              setShowUnderlineStyles(
+                (current) => !current
+              )
+            }
+          >
+            Underline
+          </button>
+
+          {showUnderlineStyles && (
+            <div className="underline-style-menu">
+
+              <button
+                onClick={() =>
+                  applyUnderline("straight")
+                }
+              >
+                Straight
+              </button>
+
+              <button
+                onClick={() =>
+                  applyUnderline("wavy")
+                }
+              >
+                Wavy
+              </button>
+
+            </div>
+          )}
+        </div>
+
 
         <button
-          className={type === "highlight" ? "selected" : ""}
-          onClick={() => setType("highlight")}
+          onClick={applyHighlight}
         >
           Highlight
         </button>
+
       </div>
 
-      {type === "underline" && (
-        <div className="underline-options">
-          <button
-            className={
-              underlineStyle === "straight"
-                ? "selected"
-                : ""
-            }
-            onClick={() => setUnderlineStyle("straight")}
-          >
-            Straight
-          </button>
 
+      <div className="annotation-color-row">
+        {COLORS.map((color) => (
           <button
+            key={color.name}
             className={
-              underlineStyle === "wavy"
-                ? "selected"
-                : ""
+              selectedColor === color.value
+                ? "annotation-color selected"
+                : "annotation-color"
             }
-            onClick={() => setUnderlineStyle("wavy")}
-          >
-            Wavy
-          </button>
-        </div>
-      )}
-
-      <div className="color-options">
-        {COLORS.map((item) => (
-          <button
-            key={item.name}
-            className={
-              color === item.value
-                ? "color-circle active"
-                : "color-circle"
+            style={{
+              backgroundColor: color.value,
+            }}
+            onClick={() =>
+              setSelectedColor(color.value)
             }
-            style={{ backgroundColor: item.value }}
-            onClick={() => setColor(item.value)}
+            title={color.name}
+            aria-label={`Use ${color.name}`}
           />
         ))}
       </div>
 
-      <div className="annotation-actions">
-        <button onClick={onCancel}>Cancel</button>
 
+      {canRemove && (
         <button
-          className="apply-button"
-          onClick={() =>
-            onApply({
-              type,
-              color,
-              underlineStyle,
-            })
-          }
+          className="annotation-remove-button"
+          onClick={onRemove}
         >
-          Apply
+          Remove annotation
         </button>
-      </div>
+      )}
+
     </div>
   );
 }

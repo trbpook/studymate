@@ -1,136 +1,183 @@
-from fastapi import FastAPI, UploadFile, File
-from pypdf import PdfReader
+import json
 import os
-from dotenv import load_dotenv
-from openai import OpenAI
-import numpy as np
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
 import psycopg
-from pydantic import BaseModel
-from typing import Optional
+from dotenv import load_dotenv
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-from pathlib import Path
+from openai import OpenAI
+from psycopg.types.json import Jsonb
+from pydantic import BaseModel, Field
+from pypdf import PdfReader
+
+
+# ============================================================
+# Environment
+# ============================================================
+
+load_dotenv()
+
+
+# ============================================================
+# FastAPI
+# ============================================================
 
 app = FastAPI()
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# connecting to PostgreSQL
+
+# ============================================================
+# Local file storage
+# ============================================================
+
+DATA_DIR = Path("data")
+DATA_DIR.mkdir(exist_ok=True)
+
+
+# ============================================================
+# Azure OpenAI
+# ============================================================
+
+client = OpenAI(
+    base_url=os.getenv("AZURE_OPENAI_ENDPOINT"),
+    api_key=os.getenv("AZURE_OPENAI_API_KEY"),
+)
+
+
+# ============================================================
+# Database
+# ============================================================
+
 def get_db_connection():
     return psycopg.connect(
         host=os.getenv("POSTGRES_HOST"),
         port=os.getenv("POSTGRES_PORT"),
         dbname=os.getenv("POSTGRES_DB"),
         user=os.getenv("POSTGRES_USER"),
-        password=os.getenv("POSTGRES_PASSWORD")
+        password=os.getenv("POSTGRES_PASSWORD"),
     )
 
-@app.get("/test-db")
-def test_db():
+
+def init_db():
+    """
+    Creates missing tables/columns.
+
+    This also acts as a small migration layer for the current MVP,
+    so replacing app.py will not require manually recreating tables.
+    """
     conn = get_db_connection()
 
-    with conn.cursor() as cursor:
-        cursor.execute("SELECT 1;")
-        result = cursor.fetchone()
-
-    conn.close()
-
-    return {
-        "message": "Database connected",
-        "result": result
-    }
-
-
-#storing documents into PostgreSQL
-
-def vector_to_string(vector):
-    return "[" + ",".join(map(str, vector)) + "]"
-
-def index_document(file_path: str, filename: str):
-    text = read_pdf(file_path)
-    chunks = split_text(text)
-
-    conn = get_db_connection()
-
-    with conn.cursor() as cursor:
-        cursor.execute(
-            """
-            INSERT INTO document (filename)
-            VALUES (%s)
-            RETURNING id;
-            """,
-            (filename,)
-        )
-
-        document_id = cursor.fetchone()[0]
-
-        for chunk in chunks:
-            embedding = get_embedding(chunk)
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                CREATE EXTENSION IF NOT EXISTS vector;
+                """
+            )
 
             cursor.execute(
                 """
-                INSERT INTO chunks (text, embedding)
-                VALUES (%s, %s::vector);
-                """,
-                (
-                    document_id,
-                    chunk,
-                    vector_to_string(embedding)
-                )
+                CREATE TABLE IF NOT EXISTS documents (
+                    id SERIAL PRIMARY KEY,
+                    filename TEXT NOT NULL,
+                    uploaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                """
             )
 
-    conn.commit()
-    conn.close()
+            # New: persistent user-facing alias for a document.
+            cursor.execute(
+                """
+                ALTER TABLE documents
+                ADD COLUMN IF NOT EXISTS alias TEXT;
+                """
+            )
 
-    return document_id, len(chunks)
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS chunks (
+                    id SERIAL PRIMARY KEY,
+                    text TEXT NOT NULL,
+                    embedding VECTOR(1536),
+                    document_id INTEGER REFERENCES documents(id)
+                );
+                """
+            )
 
-load_dotenv()
+            # Safe for an older chunks table that did not yet have document_id.
+            cursor.execute(
+                """
+                ALTER TABLE chunks
+                ADD COLUMN IF NOT EXISTS document_id INTEGER REFERENCES documents(id);
+                """
+            )
 
-# connect to LLM
-client = OpenAI(
-    base_url=os.getenv("AZURE_OPENAI_ENDPOINT"),
-    api_key=os.getenv("AZURE_OPENAI_API_KEY")
-)
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS saved_solutions (
+                    id SERIAL PRIMARY KEY,
+                    title TEXT,
+                    question TEXT NOT NULL,
+                    answer TEXT NOT NULL,
+                    document_id INTEGER REFERENCES documents(id),
+                    annotations JSONB DEFAULT '[]'::jsonb,
+                    saved_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                """
+            )
 
-# homepage
+            # Convert old titles such as "1" into "Solution 1".
+            cursor.execute(
+                """
+                UPDATE saved_solutions
+                SET title = 'Solution ' || title
+                WHERE title ~ '^[0-9]+$';
+                """
+            )
+
+        conn.commit()
+
+    except Exception:
+        conn.rollback()
+        raise
+
+    finally:
+        conn.close()
+
+
+@app.on_event("startup")
+def startup():
+    init_db()
+
+
+# ============================================================
+# Root
+# ============================================================
+
 @app.get("/")
-def home():
-    return {"message": "RAG Study Assistant is running"}
+def root():
+    return {"message": "Studymate backend is running"}
 
-# upload pdf file
-@app.post("/upload")
-async def upload_file(file: UploadFile = File(...)):
-    contents = await file.read()
 
-    temp_path = f"data/{file.filename}"
+# ============================================================
+# PDF helpers
+# ============================================================
 
-    with open(temp_path, "wb") as f:
-        f.write(contents)
-
-    document_id, count = index_document(
-        temp_path,
-        file.filename
-    )
-    count = index_document(temp_path)
-
-    return {
-        "message": "File uploaded and indexed",
-        "document_id": document_id,
-        "filename": file.filename,
-        "number_of_chunks": count
-    }
-
-# processing file
-# extracting text from pdf
-# later can be adapted to other file formats
 def read_pdf(file_path: str):
     reader = PdfReader(file_path)
-
     text = ""
 
     for page in reader.pages:
@@ -141,131 +188,425 @@ def read_pdf(file_path: str):
 
     return text
 
-# spliting text into chuncks
-def split_text(text: str, chunk_size: int = 500, overlap: int = 100):
-    chunks = []
 
+def split_text(
+    text: str,
+    chunk_size: int = 500,
+    overlap: int = 100,
+):
+    chunks = []
     start = 0
 
     while start < len(text):
         end = start + chunk_size
         chunk = text[start:end]
 
-        chunks.append(chunk)
+        if chunk.strip():
+            chunks.append(chunk)
 
         start += chunk_size - overlap
 
     return chunks
 
-# embedding: converting text to vectors
-def get_embedding(text:str):
+
+# ============================================================
+# Embeddings
+# ============================================================
+
+def get_embedding(text: str):
     response = client.embeddings.create(
         model=os.getenv("AZURE_OPENAI_EMBEDDING_DEPLOYMENT"),
-        input=text
+        input=text,
     )
 
     return response.data[0].embedding
 
-@app.get("/test-embedding")
-def test_embedding():
-    embedding = get_embedding("What is selective repeat?")
 
-    return {
-        "dimensions": len(embedding),
-        "first_10_values": embedding[:10]
-    }
+def vector_to_string(vector):
+    return "[" + ",".join(map(str, vector)) + "]"
 
-# get the cosine of 2 vectors
-# higher ratio implies closer relation of quesion and text
-def cosine_similarity(vec1, vec2):
-    vec1 = np.array(vec1)
-    vec2 = np.array(vec2)
 
-    return np.dot(vec1, vec2) / (np.linalg.norm(vec1) * np.linalg.norm(vec2))
+# ============================================================
+# Indexing
+# ============================================================
 
-#retrival function
-def retrieve_relevant_chunks(question:str, document_id: Optional[int] = None, top_k = 3):
-    question_embedding = get_embedding(question)
-    question_vector = vector_to_string(question_embedding)
+def index_document(file_path: str, filename: str):
+    text = read_pdf(file_path)
+
+    if not text.strip():
+        raise ValueError("No readable text was found in the PDF.")
+
+    chunks = split_text(text)
+
     conn = get_db_connection()
 
-    with conn.cursor() as cursor:
-
-        if document_id is None: #Search all
+    try:
+        with conn.cursor() as cursor:
             cursor.execute(
                 """
-                SELECT 
-                    text,
-                    1 - (embedding <=> %s::vector) AS similarity
-                FROM chunks
-                ORDER BY embedding <=> %s::vector
-                LIMIT %s;
+                INSERT INTO documents (filename)
+                VALUES (%s)
+                RETURNING id;
                 """,
-                (
-                    question_vector,
-                    question_vector,
-                    top_k
-                )
+                (filename,),
             )
 
-        else: #Search only one document
-            cursor.execute(
-                """
-                SELECT 
-                    text,
-                    1 - (embedding <=> %s::vector) AS similarity
-                FROM chunks
-                WHERE document_id = %s
-                ORDER BY embedding <=> %s::vector
-                LIMIT %s;
-                """,
-                (
-                    question_vector,
-                    question_vector,
-                    top_k
+            document_id = cursor.fetchone()[0]
+
+            for chunk in chunks:
+                embedding = get_embedding(chunk)
+                embedding_string = vector_to_string(embedding)
+
+                cursor.execute(
+                    """
+                    INSERT INTO chunks (
+                        text,
+                        embedding,
+                        document_id
+                    )
+                    VALUES (
+                        %s,
+                        %s::vector,
+                        %s
+                    );
+                    """,
+                    (
+                        chunk,
+                        embedding_string,
+                        document_id,
+                    ),
                 )
-            )
 
-        rows = cursor.fetchall()
+        conn.commit()
+        return document_id, len(chunks)
 
-    conn.close()
+    except Exception:
+        conn.rollback()
+        raise
 
-    return [
-        {
-            "chunk": row[0],
-            "score": row[1]
+    finally:
+        conn.close()
+
+
+# ============================================================
+# Upload
+# ============================================================
+
+@app.post("/upload")
+async def upload_file(file: UploadFile = File(...)):
+    filename = Path(file.filename or "upload.pdf").name
+
+    if not filename.lower().endswith(".pdf"):
+        raise HTTPException(
+            status_code=400,
+            detail="Only PDF files are supported.",
+        )
+
+    contents = await file.read()
+    file_path = DATA_DIR / filename
+
+    try:
+        with open(file_path, "wb") as f:
+            f.write(contents)
+
+        document_id, count = index_document(
+            str(file_path),
+            filename,
+        )
+
+        return {
+            "message": "File uploaded and indexed",
+            "document_id": document_id,
+            "filename": filename,
+            "number_of_chunks": count,
         }
-        for row in rows
-    ]
 
-@app.get("/test-retrieval")
-def test_retrieval(question:str):
-    return retrieve_relevant_chunks(question)
+    except Exception as error:
+        print("Upload error:", error)
+        raise
 
-# ask question
-class AskRequest(BaseModel):
-    question: str
-    document_id: Optional[int] = None
 
-@app.post("/ask")
-def ask(request: AskRequest):
-    retrieved_chunks = retrieve_relevant_chunks(request.question, request.document_id)
+# ============================================================
+# Documents
+# ============================================================
 
-    answer = generate_answer(
-        request.question,
-        retrieved_chunks
-    )
-    return {
-        "question":request.question,
-        "document_id": request.document_id,
-        "answer": answer,
-        "sources": retrieved_chunks
-    }
+@app.get("/documents")
+def get_documents():
+    conn = get_db_connection()
 
-# answering
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT
+                    id,
+                    filename,
+                    alias,
+                    uploaded_at
+                FROM documents
+                ORDER BY uploaded_at DESC;
+                """
+            )
+
+            rows = cursor.fetchall()
+
+        return [
+            {
+                "id": row[0],
+                "filename": row[1],
+                "alias": row[2],
+                "uploaded_at": row[3],
+            }
+            for row in rows
+        ]
+
+    finally:
+        conn.close()
+
+
+class DocumentAliasRequest(BaseModel):
+    alias: Optional[str] = None
+
+
+@app.patch("/documents/{document_id}/alias")
+def update_document_alias(
+    document_id: int,
+    request: DocumentAliasRequest,
+):
+    alias = request.alias.strip() if request.alias else None
+
+    if alias == "":
+        alias = None
+
+    conn = get_db_connection()
+
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE documents
+                SET alias = %s
+                WHERE id = %s
+                RETURNING id, filename, alias;
+                """,
+                (alias, document_id),
+            )
+
+            row = cursor.fetchone()
+
+        if row is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Document not found.",
+            )
+
+        conn.commit()
+
+        return {
+            "id": row[0],
+            "filename": row[1],
+            "alias": row[2],
+        }
+
+    except Exception:
+        conn.rollback()
+        raise
+
+    finally:
+        conn.close()
+
+
+@app.get("/documents/{document_id}/download")
+def download_document(document_id: int):
+    conn = get_db_connection()
+
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT filename
+                FROM documents
+                WHERE id = %s;
+                """,
+                (document_id,),
+            )
+
+            row = cursor.fetchone()
+
+        if row is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Document not found.",
+            )
+
+        filename = row[0]
+        file_path = DATA_DIR / filename
+
+        if not file_path.exists():
+            raise HTTPException(
+                status_code=404,
+                detail="File not found on disk.",
+            )
+
+        return FileResponse(
+            path=str(file_path),
+            filename=filename,
+            media_type="application/pdf",
+        )
+
+    finally:
+        conn.close()
+
+
+@app.delete("/documents/{document_id}")
+def delete_document(document_id: int):
+    conn = get_db_connection()
+
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT filename
+                FROM documents
+                WHERE id = %s;
+                """,
+                (document_id,),
+            )
+
+            row = cursor.fetchone()
+
+            if row is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Document not found.",
+                )
+
+            filename = row[0]
+
+            # Preserve saved revision cards even if the original document
+            # is deleted.
+            cursor.execute(
+                """
+                UPDATE saved_solutions
+                SET document_id = NULL
+                WHERE document_id = %s;
+                """,
+                (document_id,),
+            )
+
+            cursor.execute(
+                """
+                DELETE FROM chunks
+                WHERE document_id = %s;
+                """,
+                (document_id,),
+            )
+
+            cursor.execute(
+                """
+                DELETE FROM documents
+                WHERE id = %s;
+                """,
+                (document_id,),
+            )
+
+        conn.commit()
+
+        file_path = DATA_DIR / filename
+
+        if file_path.exists():
+            file_path.unlink()
+
+        return {"message": "Document deleted successfully"}
+
+    except Exception:
+        conn.rollback()
+        raise
+
+    finally:
+        conn.close()
+
+
+# ============================================================
+# RAG retrieval
+# ============================================================
+
+def retrieve_relevant_chunks(
+    question: str,
+    document_id: Optional[int] = None,
+    top_k: int = 3,
+):
+    question_embedding = get_embedding(question)
+    question_vector = vector_to_string(question_embedding)
+
+    conn = get_db_connection()
+
+    try:
+        with conn.cursor() as cursor:
+            if document_id is None:
+                cursor.execute(
+                    """
+                    SELECT
+                        text,
+                        1 - (embedding <=> %s::vector) AS similarity
+                    FROM chunks
+                    WHERE embedding IS NOT NULL
+                    ORDER BY embedding <=> %s::vector
+                    LIMIT %s;
+                    """,
+                    (
+                        question_vector,
+                        question_vector,
+                        top_k,
+                    ),
+                )
+
+            else:
+                cursor.execute(
+                    """
+                    SELECT
+                        text,
+                        1 - (embedding <=> %s::vector) AS similarity
+                    FROM chunks
+                    WHERE
+                        document_id = %s
+                        AND embedding IS NOT NULL
+                    ORDER BY embedding <=> %s::vector
+                    LIMIT %s;
+                    """,
+                    (
+                        question_vector,
+                        document_id,
+                        question_vector,
+                        top_k,
+                    ),
+                )
+
+            rows = cursor.fetchall()
+
+        return [
+            {
+                "chunk": row[0],
+                "score": float(row[1]),
+            }
+            for row in rows
+        ]
+
+    finally:
+        conn.close()
+
+
+# ============================================================
+# Main answer
+# ============================================================
+
 def generate_answer(question: str, retrieved_chunks):
+    if not retrieved_chunks:
+        return "I don't know based on the uploaded document."
+
     context = "\n\n".join(
-        chunk["chunk"] for chunk in retrieved_chunks
+        chunk["chunk"]
+        for chunk in retrieved_chunks
     )
 
     response = client.chat.completions.create(
@@ -275,59 +616,68 @@ def generate_answer(question: str, retrieved_chunks):
                 "role": "system",
                 "content": (
                     "You are a study assistant. "
-                    "Answer using only the context provided."
-                    "If the answer is not in the context, say you don't know. "
-                )
+                    "Answer using only the provided context. "
+                    "Explain clearly for a student. "
+                    "You may use simple Markdown formatting such as "
+                    "**bold text** when it improves readability. "
+                    "If the answer is not supported by the context, "
+                    "say you don't know."
+                ),
             },
             {
                 "role": "user",
                 "content": f"""
 Context:
+
 {context}
 
 Question:
+
 {question}
-"""
-            }
-        ]
+""",
+            },
+        ],
     )
 
     return response.choices[0].message.content
 
-# get all documents uploaded
-@app.get("/documents")
-def get_documents():
-    conn = get_db_connection()
 
-    with conn.cursor() as cursor:
-        cursor.execute(
-            """
-            SELECT id, filename, uploaded_at
-            FROM documents
-            ORDER BY uploaded_at DESC;
-            """
-        )
+class AskRequest(BaseModel):
+    question: str
+    document_id: Optional[int] = None
 
-        rows = cursor.fetchall()
 
-    conn.close()
+@app.post("/ask")
+def ask(request: AskRequest):
+    retrieved_chunks = retrieve_relevant_chunks(
+        question=request.question,
+        document_id=request.document_id,
+    )
 
-    return [
-        {
-            "id": row[0],
-            "filename": row[1],
-            "uploaded_at": row[2]
-        }
-        for row in rows
-    ]
+    answer = generate_answer(
+        request.question,
+        retrieved_chunks,
+    )
 
-# quick dna
+    return {
+        "question": request.question,
+        "document_id": request.document_id,
+        "answer": answer,
+        "sources": retrieved_chunks,
+    }
+
+
+# ============================================================
+# Quick Ask
+# ============================================================
+
 QUICK_ACTIONS = {
     "why": "Why is this true? Explain the reason briefly.",
     "explain_more": "Explain this in more detail.",
     "simplify": "Explain this in simpler words.",
-    "example": "Give a simple example of this concept."
+    "example": "Give a simple example of this concept.",
 }
+
 
 class QuickAskRequest(BaseModel):
     selected_text: str
@@ -335,13 +685,15 @@ class QuickAskRequest(BaseModel):
     question: Optional[str] = None
     document_id: Optional[int] = None
 
+
 def generate_quick_answer(
     selected_text: str,
     question: str,
-    retrieved_chunks
+    retrieved_chunks,
 ):
     context = "\n\n".join(
-        chunk["chunk"] for chunk in retrieved_chunks
+        chunk["chunk"]
+        for chunk in retrieved_chunks
     )
 
     response = client.chat.completions.create(
@@ -351,43 +703,53 @@ def generate_quick_answer(
                 "role": "system",
                 "content": (
                     "You are a concise study assistant. "
-                    "Explain only the selected concept. "
-                    "Keep the answer short and focused. "
-                    "Use the retrieved context when helpful."
-                )
+                    "The student selected a specific piece of text "
+                    "from an answer. Explain only that concept. "
+                    "Keep the response focused and relatively short. "
+                    "Use the retrieved document context when helpful."
+                ),
             },
             {
                 "role": "user",
                 "content": f"""
 Selected text:
+
 {selected_text}
 
-Retrieved context:
+Relevant document context:
+
 {context}
 
-Question:
+Student question:
+
 {question}
-"""
-            }
-        ]
+""",
+            },
+        ],
     )
 
     return response.choices[0].message.content
 
+
 @app.post("/quick-ask")
 def quick_ask(request: QuickAskRequest):
-
     if request.action:
         question = QUICK_ACTIONS.get(request.action)
 
         if question is None:
-            return {"error": "Invalid quick action"}
+            raise HTTPException(
+                status_code=400,
+                detail="Unknown quick action.",
+            )
 
     elif request.question:
         question = request.question
 
     else:
-        return {"error": "Provide either action or question"}
+        raise HTTPException(
+            status_code=400,
+            detail="Provide either action or question.",
+        )
 
     retrieval_query = (
         request.selected_text
@@ -396,101 +758,486 @@ def quick_ask(request: QuickAskRequest):
     )
 
     retrieved_chunks = retrieve_relevant_chunks(
-        retrieval_query,
-        request.document_id
+        question=retrieval_query,
+        document_id=request.document_id,
     )
 
     answer = generate_quick_answer(
-        request.selected_text,
-        question,
-        retrieved_chunks
+        selected_text=request.selected_text,
+        question=question,
+        retrieved_chunks=retrieved_chunks,
     )
 
     return {
         "selected_text": request.selected_text,
         "action": request.action,
         "question": question,
-        "answer": answer
+        "answer": answer,
     }
 
-# download file
-@app.get("/documents/{document_id}/download")
-def download_document(document_id: int):
-    conn = get_db_connection()
 
-    with conn.cursor() as cursor:
-        cursor.execute(
-            """
-            SELECT filename
-            FROM documents
-            WHERE id = %s;
-            """,
-            (document_id,)
-        )
+# ============================================================
+# Saved Solutions
+# ============================================================
 
-        row = cursor.fetchone()
+class SaveSolutionRequest(BaseModel):
+    title: Optional[str] = None
+    question: str
+    answer: str
+    document_id: Optional[int] = None
+    annotations: List[Dict[str, Any]] = Field(default_factory=list)
 
-    conn.close()
 
-    if row is None:
-        return {"error": "Document not found"}
-
-    filename = row[0]
-    file_path = Path("data") / filename
-
-    return FileResponse(
-        path=file_path,
-        filename=filename,
-        media_type="application/pdf"
+@app.post("/saved-solutions")
+def save_solution(request: SaveSolutionRequest):
+    requested_title = (
+        request.title.strip()
+        if request.title and request.title.strip()
+        else None
     )
 
-# delete file
-@app.delete("/documents/{document_id}")
-def delete_document(document_id: int):
     conn = get_db_connection()
 
-    with conn.cursor() as cursor:
-        cursor.execute(
-            """
-            SELECT filename
-            FROM documents
-            WHERE id = %s;
-            """,
-            (document_id,)
-        )
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO saved_solutions (
+                    title,
+                    question,
+                    answer,
+                    document_id,
+                    annotations
+                )
+                VALUES (
+                    %s,
+                    %s,
+                    %s,
+                    %s,
+                    %s
+                )
+                RETURNING id;
+                """,
+                (
+                    requested_title,
+                    request.question,
+                    request.answer,
+                    request.document_id,
+                    Jsonb(request.annotations),
+                ),
+            )
 
-        row = cursor.fetchone()
+            solution_id = cursor.fetchone()[0]
+
+            if requested_title is None:
+                requested_title = f"Solution {solution_id}"
+
+                cursor.execute(
+                    """
+                    UPDATE saved_solutions
+                    SET title = %s
+                    WHERE id = %s;
+                    """,
+                    (
+                        requested_title,
+                        solution_id,
+                    ),
+                )
+
+        conn.commit()
+
+        return {
+            "message": "Solution saved",
+            "id": solution_id,
+            "title": requested_title,
+        }
+
+    except Exception:
+        conn.rollback()
+        raise
+
+    finally:
+        conn.close()
+
+
+@app.get("/saved-solutions")
+def get_saved_solutions():
+    conn = get_db_connection()
+
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT
+                    id,
+                    title,
+                    question,
+                    answer,
+                    document_id,
+                    annotations,
+                    saved_at
+                FROM saved_solutions
+                ORDER BY saved_at DESC;
+                """
+            )
+
+            rows = cursor.fetchall()
+
+        return [
+            {
+                "id": row[0],
+                "title": row[1],
+                "question": row[2],
+                "answer": row[3],
+                "document_id": row[4],
+                "annotations": row[5] or [],
+                "saved_at": row[6],
+            }
+            for row in rows
+        ]
+
+    finally:
+        conn.close()
+
+
+def get_saved_solution(solution_id: int):
+    conn = get_db_connection()
+
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT
+                    id,
+                    title,
+                    question,
+                    answer,
+                    document_id,
+                    annotations
+                FROM saved_solutions
+                WHERE id = %s;
+                """,
+                (solution_id,),
+            )
+
+            row = cursor.fetchone()
 
         if row is None:
-            conn.close()
-            return {"error": "Document not found"}
+            raise HTTPException(
+                status_code=404,
+                detail="Saved solution not found.",
+            )
 
-        filename = row[0]
+        return {
+            "id": row[0],
+            "title": row[1],
+            "question": row[2],
+            "answer": row[3],
+            "document_id": row[4],
+            "annotations": row[5] or [],
+        }
 
-        cursor.execute(
-            """
-            DELETE FROM chunks
-            WHERE document_id = %s;
-            """,
-            (document_id,)
+    finally:
+        conn.close()
+
+
+class RenameSolutionRequest(BaseModel):
+    title: str
+
+
+@app.patch("/saved-solutions/{solution_id}")
+def rename_saved_solution(
+    solution_id: int,
+    request: RenameSolutionRequest,
+):
+    title = request.title.strip()
+
+    if not title:
+        raise HTTPException(
+            status_code=400,
+            detail="Title cannot be empty.",
         )
 
-        cursor.execute(
-            """
-            DELETE FROM documents
-            WHERE id = %s;
-            """,
-            (document_id,)
-        )
+    conn = get_db_connection()
 
-    conn.commit()
-    conn.close()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE saved_solutions
+                SET title = %s
+                WHERE id = %s
+                RETURNING id, title;
+                """,
+                (
+                    title,
+                    solution_id,
+                ),
+            )
 
-    file_path = Path("data") / filename
+            row = cursor.fetchone()
 
-    if file_path.exists():
-        file_path.unlink()
+        if row is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Saved solution not found.",
+            )
+
+        conn.commit()
+
+        return {
+            "id": row[0],
+            "title": row[1],
+        }
+
+    except Exception:
+        conn.rollback()
+        raise
+
+    finally:
+        conn.close()
+
+
+@app.delete("/saved-solutions/{solution_id}")
+def delete_saved_solution(solution_id: int):
+    conn = get_db_connection()
+
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                DELETE FROM saved_solutions
+                WHERE id = %s
+                RETURNING id;
+                """,
+                (solution_id,),
+            )
+
+            row = cursor.fetchone()
+
+        if row is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Saved solution not found.",
+            )
+
+        conn.commit()
+
+        return {
+            "message": "Saved solution deleted",
+            "id": row[0],
+        }
+
+    except Exception:
+        conn.rollback()
+        raise
+
+    finally:
+        conn.close()
+
+
+# ============================================================
+# Revision Quiz
+# ============================================================
+
+def generate_revision_question(solution):
+    response = client.chat.completions.create(
+        model=os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT"),
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You create short revision questions for students. "
+                    "Choose one important concept from the saved solution "
+                    "and ask one concise open-ended question. "
+                    "Return only the question."
+                ),
+            },
+            {
+                "role": "user",
+                "content": f"""
+Original question:
+
+{solution["question"]}
+
+Saved solution:
+
+{solution["answer"]}
+""",
+            },
+        ],
+    )
+
+    return response.choices[0].message.content.strip()
+
+
+@app.post("/saved-solutions/{solution_id}/quiz")
+def revision_quiz(solution_id: int):
+    solution = get_saved_solution(solution_id)
+    question = generate_revision_question(solution)
 
     return {
-        "message": "Document deleted"
+        "solution_id": solution_id,
+        "question": question,
     }
+
+
+def get_random_saved_solution():
+    conn = get_db_connection()
+
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT
+                    id,
+                    title,
+                    question,
+                    answer,
+                    document_id,
+                    annotations
+                FROM saved_solutions
+                ORDER BY RANDOM()
+                LIMIT 1;
+                """
+            )
+
+            row = cursor.fetchone()
+
+        if row is None:
+            raise HTTPException(
+                status_code=404,
+                detail="No saved solutions available.",
+            )
+
+        return {
+            "id": row[0],
+            "title": row[1],
+            "question": row[2],
+            "answer": row[3],
+            "document_id": row[4],
+            "annotations": row[5] or [],
+        }
+
+    finally:
+        conn.close()
+
+
+@app.post("/revision/random-quiz")
+def random_revision_quiz():
+    """
+    Random question from the complete saved revision set.
+    """
+    solution = get_random_saved_solution()
+    question = generate_revision_question(solution)
+
+    return {
+        "solution_id": solution["id"],
+        "question": question,
+    }
+
+
+# ============================================================
+# Quiz evaluation
+# ============================================================
+
+class QuizAnswerRequest(BaseModel):
+    question: str
+    answer: str
+
+
+def parse_json_response(content: str):
+    content = content.strip()
+
+    if content.startswith("```"):
+        lines = content.splitlines()
+
+        if len(lines) >= 3:
+            content = "\n".join(lines[1:-1])
+
+    return json.loads(content)
+
+
+def evaluate_revision_answer(
+    solution,
+    quiz_question: str,
+    user_answer: str,
+):
+    response = client.chat.completions.create(
+        model=os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT"),
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You evaluate a student's understanding based on "
+                    "the provided saved study solution. "
+                    "Return ONLY valid JSON and no Markdown."
+                ),
+            },
+            {
+                "role": "user",
+                "content": f"""
+Source study solution:
+
+{solution["answer"]}
+
+Quiz question:
+
+{quiz_question}
+
+Student answer:
+
+{user_answer}
+
+Evaluate the answer.
+
+Focus on what the student understands, what important key points are
+missing, and what a strong answer should contain.
+
+Return exactly this JSON structure:
+
+{{
+  "score": 0,
+  "overall": "",
+  "correct": [],
+  "key_points_missing": [],
+  "incorrect": [],
+  "suggested_answer": ""
+}}
+
+Rules:
+- score must be an integer from 0 to 100.
+- key_points_missing should be specific concepts or statements the
+  student should have included.
+- suggested_answer should be a concise model answer to the quiz question.
+""",
+            },
+        ],
+    )
+
+    content = response.choices[0].message.content
+
+    try:
+        result = parse_json_response(content)
+
+    except Exception:
+        raise HTTPException(
+            status_code=500,
+            detail="AI returned an invalid evaluation format.",
+        )
+
+    return result
+
+
+@app.post("/saved-solutions/{solution_id}/evaluate")
+def evaluate_quiz(
+    solution_id: int,
+    request: QuizAnswerRequest,
+):
+    solution = get_saved_solution(solution_id)
+
+    return evaluate_revision_answer(
+        solution=solution,
+        quiz_question=request.question,
+        user_answer=request.answer,
+    )

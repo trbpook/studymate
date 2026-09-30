@@ -1,120 +1,197 @@
 import { useState } from "react";
+
 import { quickAsk } from "../api";
+
+
+const QUICK_ACTIONS = [
+  {
+    action: "why",
+    label: "Why?",
+  },
+  {
+    action: "explain_more",
+    label: "Explain more",
+  },
+  {
+    action: "simplify",
+    label: "Simplify",
+  },
+  {
+    action: "example",
+    label: "Give example",
+  },
+];
+
 
 export default function InlineQnA({
   annotation,
   documentId,
   onAddMessage,
+  onCollapse,
 }) {
-  const [question, setQuestion] = useState("");
-  const [loading, setLoading] = useState(false);
+  const [question, setQuestion] =
+    useState("");
 
-  async function ask({ action = null, customQuestion = null }) {
+  const [loading, setLoading] =
+    useState(false);
+
+
+  async function ask({
+    action = null,
+    customQuestion = null,
+  }) {
+    if (
+      !action &&
+      !customQuestion?.trim()
+    ) {
+      return;
+    }
+
     setLoading(true);
 
     try {
       const result = await quickAsk({
-        selectedText: annotation.text,
+        selectedText:
+          annotation.text,
         action,
-        question: customQuestion,
+        question:
+          customQuestion,
         documentId,
       });
 
-      onAddMessage(annotation.id, {
+      onAddMessage({
         id: crypto.randomUUID(),
         question:
           customQuestion ||
-          {
-            why: "Why?",
-            explain_more: "Explain more",
-            simplify: "Simplify",
-            example: "Give an example",
-          }[action],
+          QUICK_ACTIONS.find(
+            (item) =>
+              item.action === action
+          )?.label ||
+          "Quick Q&A",
         answer: result.answer,
       });
+
+      setQuestion("");
+    } catch (error) {
+      console.error(
+        "Quick Q&A failed:",
+        error
+      );
     } finally {
       setLoading(false);
     }
   }
 
-  async function handleSubmit() {
-    if (!question.trim()) return;
 
-    const currentQuestion = question;
-    setQuestion("");
+  const messages =
+    annotation.messages || [];
 
-    await ask({
-      customQuestion: currentQuestion,
-    });
-  }
 
   return (
     <div className="inline-qna">
-      {annotation.messages.length === 0 && (
-        <>
-          <div className="quick-actions">
-            <button onClick={() => ask({ action: "why" })}>
-              Why?
-            </button>
 
+      <div className="inline-qna-header">
+
+        <div>
+          <strong>Quick Q&A</strong>
+
+        </div>
+
+        <button
+          className="inline-qna-hide"
+          onClick={onCollapse}
+        >
+          Hide
+        </button>
+
+      </div>
+
+
+      <div className="quick-action-row">
+
+        {QUICK_ACTIONS.map(
+          (item) => (
             <button
-              onClick={() => ask({ action: "explain_more" })}
+              key={item.action}
+              onClick={() =>
+                ask({
+                  action:
+                    item.action,
+                })
+              }
+              disabled={loading}
             >
-              Explain more
+              {item.label}
             </button>
+          )
+        )}
 
-            <button
-              onClick={() => ask({ action: "simplify" })}
-            >
-              Simplify
-            </button>
+      </div>
 
-            <button onClick={() => ask({ action: "example" })}>
-              Example
-            </button>
-          </div>
-        </>
-      )}
 
-      <div className="qna-messages">
-        {annotation.messages.map((message) => (
-          <div className="qna-message" key={message.id}>
-            <div className="qna-question">
+      {messages.map(
+        (message) => (
+          <div
+            key={message.id}
+            className="inline-qna-message"
+          >
+
+            <div className="inline-qna-question">
               {message.question}
             </div>
 
-            <div className="qna-answer">
+            <div className="inline-qna-answer">
               {message.answer}
             </div>
-          </div>
-        ))}
-      </div>
 
-      {loading && (
-        <div className="qna-loading">
-          Thinking…
-        </div>
+          </div>
+        )
       )}
 
-      <div className="qna-input">
+
+      <div className="inline-qna-input-row">
+
         <input
           value={question}
-          onChange={(e) => setQuestion(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") {
-              handleSubmit();
+          onChange={(event) =>
+            setQuestion(
+              event.target.value
+            )
+          }
+          placeholder="Ask about this highlight..."
+          onKeyDown={(event) => {
+            if (
+              event.key === "Enter" &&
+              question.trim() &&
+              !loading
+            ) {
+              ask({
+                customQuestion:
+                  question,
+              });
             }
           }}
-          placeholder="Ask about this..."
         />
 
         <button
-          onClick={handleSubmit}
-          disabled={loading}
+          onClick={() =>
+            ask({
+              customQuestion:
+                question,
+            })
+          }
+          disabled={
+            loading ||
+            !question.trim()
+          }
         >
-          ↗
+          {loading
+            ? "..."
+            : "Ask"}
         </button>
+
       </div>
+
     </div>
   );
 }

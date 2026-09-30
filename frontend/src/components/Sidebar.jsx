@@ -2,25 +2,56 @@ export default function Sidebar({
   currentPage,
   setCurrentPage,
 }) {
-  const pages = [
-    ["chat", "Chat"],
-    ["documents", "Documents"],
-    ["revision", "Revision"],
-  ];
-
   return (
     <aside className="sidebar">
-      <div className="logo">Studymate</div>
 
-      {pages.map(([page, label]) => (
+      <div className="sidebar-logo">
+        Studymate
+      </div>
+
+      <nav className="sidebar-nav">
+
         <button
-          key={page}
-          className={currentPage === page ? "active" : ""}
-          onClick={() => setCurrentPage(page)}
+          className={
+            currentPage === "chat"
+              ? "active"
+              : ""
+          }
+          onClick={() =>
+            setCurrentPage("chat")
+          }
         >
-          {label}
+          Chat
         </button>
-      ))}
+
+        <button
+          className={
+            currentPage === "documents"
+              ? "active"
+              : ""
+          }
+          onClick={() =>
+            setCurrentPage("documents")
+          }
+        >
+          Documents
+        </button>
+
+        <button
+          className={
+            currentPage === "revision"
+              ? "active"
+              : ""
+          }
+          onClick={() =>
+            setCurrentPage("revision")
+          }
+        >
+          Revision
+        </button>
+
+      </nav>
+
     </aside>
   );
 }

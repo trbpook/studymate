@@ -3,6 +3,7 @@ import Sidebar from "./components/Sidebar";
 import ChatPage from "./pages/ChatPage";
 import DocumentsPage from "./pages/DocumentsPage";
 import "./App.css";
+import RevisionPage from "./pages/RevisionPage";
 
 function App() {
   const [currentPage, setCurrentPage] = useState("chat");
@@ -23,7 +24,7 @@ function App() {
       )}
 
       {currentPage === "revision" && (
-        <div>Revision page coming next</div>
+        <RevisionPage />
       )}
     </div>
   );
